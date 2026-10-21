@@ -11,6 +11,7 @@ Quill - a sleek word processor with Mendeley Cite-compatible citations.
 Run:  pip install -r requirements.txt  &&  python quill.py [file.docx]
 """
 import base64
+import io
 import json
 import random
 import re
@@ -21,10 +22,12 @@ import uuid
 from pathlib import Path
 from xml.sax.saxutils import quoteattr
 
-from PySide6.QtCore import QMarginsF, QSettings, QStandardPaths, Qt, QTimer
-from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QKeySequence,
-                           QPageLayout, QPageSize, QPdfWriter, QTextBlockFormat,
-                           QTextCharFormat, QTextCursor, QTextListFormat)
+from PySide6.QtCore import (QBuffer, QIODevice, QMarginsF, QSettings, QStandardPaths, Qt,
+                            QTimer, QUrl, Signal)
+from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QImage, QKeySequence,
+                           QPageLayout, QPageSize, QPdfWriter, QPixmap, QTextBlockFormat,
+                           QTextCharFormat, QTextCursor, QTextDocument, QTextImageFormat,
+                           QTextListFormat)
 from PySide6.QtWidgets import (QApplication, QColorDialog, QComboBox, QDialog,
                                QDialogButtonBox, QDockWidget, QFileDialog,
                                QFontComboBox, QFormLayout, QFrame, QHBoxLayout,
@@ -75,6 +78,20 @@ LATTE = dict(
     lavender="#7287fd", text="#4c4f69", subtext1="#5c5f77", subtext0="#6c6f85",
     overlay0="#9ca0b0", surface2="#acb0be", surface1="#bcc0cc", surface0="#ccd0da",
     base="#eff1f5", mantle="#e6e9ef", crust="#dce0e8", accent_bg="rgba(136,57,239,0.14)")
+
+MOCHA.update(sapphire="#74c7ec", sky="#89dceb", maroon="#eba0ac", flamingo="#f2cdcd")
+LATTE.update(sapphire="#209fb5", sky="#04a5e5", maroon="#e64553", flamingo="#dd7878")
+
+IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
+A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+WP_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+MAX_IMG_PX = 780
+
+URL_RE = re.compile(r"(https?://\S+|www\.\S+|\b[\w.+-]+@[\w-]+\.[\w.]+\b|\b10\.\d{4,9}/\S+)")
+NUM_RE = re.compile(r"(?<![\w.])\d+(?:[.,]\d+)*%?(?!\w)")
+CAPS_RE = re.compile(r"\b[A-Z]{2,}\b")
+QUOTE_RE = re.compile(r"“[^”\n]*”|\"[^\"\n]*\"|‘[^’\n]*’")
+PAREN_RE = re.compile(r"\([^()\n]*\)")
 
 QSS = """
 * { font-family: "Inter", "Segoe UI", "SF Pro Text", "Noto Sans", sans-serif; font-size: 13px; }
@@ -530,6 +547,32 @@ def _citation_sdt(par, cit_json, text, fmt, heading):
     par._p.append(sdt)
 
 
+def _resource_image(qdoc, name):
+    v = qdoc.resource(QTextDocument.ResourceType.ImageResource, QUrl(name))
+    if isinstance(v, QImage):
+        return v
+    if isinstance(v, QPixmap):
+        return v.toImage()
+    img = QImage(name)
+    return img if not img.isNull() else None
+
+
+def _write_image(qdoc, par, imf):
+    img = _resource_image(qdoc, imf.name())
+    if img is None or img.isNull():
+        return
+    buf = QBuffer()
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    img.save(buf, "PNG")
+    w = imf.width() or img.width()
+    h = imf.height() or img.height()
+    max_pt = 453.0  # printable width on A4 with 25.4 mm margins
+    wp, hp = w * 0.75, h * 0.75
+    if wp > max_pt:
+        hp, wp = hp * max_pt / wp, max_pt
+    par.add_run().add_picture(io.BytesIO(bytes(buf.data())), width=Pt(wp), height=Pt(hp))
+
+
 def write_docx(qdoc, path):
     d = Document()
     normal = d.styles["Normal"]
@@ -586,6 +629,10 @@ def write_docx(qdoc, path):
         while not it.atEnd():
             frag = it.fragment()
             fmt = frag.charFormat()
+            if fmt.isImageFormat():
+                _write_image(qdoc, par, fmt.toImageFormat())
+                it += 1
+                continue
             text = frag.text().replace("\ufffc", "")
             if text:
                 if fmt.hasProperty(CITE_PROP):
@@ -674,6 +721,35 @@ def read_docx(path, qdoc, lib):
             if lib.find(iid) is None:
                 lib.add(dict(data), replace=False)
 
+    def insert_run_images(r_el):
+        for dr in r_el.iter(qn("w:drawing")):
+            blip = dr.find(".//{%s}blip" % A_NS)
+            if blip is None:
+                continue
+            try:
+                blob = d.part.related_parts[blip.get(qn("r:embed"))].blob
+            except Exception:
+                continue
+            img = QImage.fromData(blob)
+            if img.isNull():
+                continue
+            w, h = img.width(), img.height()
+            ext = dr.find(".//{%s}extent" % WP_NS)
+            if ext is not None:
+                try:
+                    w, h = max(1, int(int(ext.get("cx")) / 9525)), max(1, int(int(ext.get("cy")) / 9525))
+                except Exception:
+                    pass
+            if w > MAX_IMG_PX:
+                h, w = int(h * MAX_IMG_PX / w), MAX_IMG_PX
+            name = "img_" + uuid.uuid4().hex
+            qdoc.addResource(QTextDocument.ResourceType.ImageResource, QUrl(name), img)
+            f = QTextImageFormat()
+            f.setName(name)
+            f.setWidth(w)
+            f.setHeight(h)
+            cur.insertImage(f)
+
     def para(el, bib):
         par = Paragraph(el, d._body)
         name = par.style.name if par.style is not None else ""
@@ -725,6 +801,7 @@ def read_docx(path, qdoc, lib):
 
         def add_run(r_el):
             run = Run(r_el, par)
+            insert_run_images(r_el)
             text = run.text
             if text:
                 cur.insertText(text.replace("\n", "\u2028"), run_fmt(run, level))
@@ -786,6 +863,52 @@ def read_docx(path, qdoc, lib):
 # --------------------------------------------------------------------------- widgets
 class Editor(QTextEdit):
     PAGE_WIDTH = 860
+    imageActivated = Signal()
+
+    def insert_image(self, image):
+        if image is None or image.isNull():
+            return False
+        w, h = image.width(), image.height()
+        if w > MAX_IMG_PX:
+            h, w = int(h * MAX_IMG_PX / w), MAX_IMG_PX
+        name = "img_" + uuid.uuid4().hex
+        self.document().addResource(QTextDocument.ResourceType.ImageResource, QUrl(name), image)
+        f = QTextImageFormat()
+        f.setName(name)
+        f.setWidth(w)
+        f.setHeight(h)
+        cur = self.textCursor()
+        cur.insertImage(f)
+        self.setTextCursor(cur)
+        return True
+
+    @staticmethod
+    def _image_paths(src):
+        if not src.hasUrls():
+            return []
+        return [u.toLocalFile() for u in src.urls()
+                if u.isLocalFile() and u.toLocalFile().lower().endswith(IMG_EXT)]
+
+    def canInsertFromMimeData(self, src):
+        return src.hasImage() or bool(self._image_paths(src)) or super().canInsertFromMimeData(src)
+
+    def image_at_cursor(self, cur):
+        """Return a cursor selecting an image next to `cur`, or None."""
+        for move in (QTextCursor.MoveOperation.Right, QTextCursor.MoveOperation.Left):
+            c = QTextCursor(cur)
+            c.clearSelection()
+            c.movePosition(move, QTextCursor.MoveMode.KeepAnchor)
+            if c.hasSelection() and c.charFormat().isImageFormat():
+                return c
+        return None
+
+    def mouseDoubleClickEvent(self, e):
+        c = self.image_at_cursor(self.cursorForPosition(e.pos()))
+        if c is not None:
+            self.setTextCursor(c)
+            self.imageActivated.emit()
+            return
+        super().mouseDoubleClickEvent(e)
 
     def __init__(self):
         super().__init__()
@@ -799,6 +922,16 @@ class Editor(QTextEdit):
         self.setViewportMargins(m, 18, m, 18)
 
     def insertFromMimeData(self, source):
+        paths = self._image_paths(source)
+        if paths:
+            for pth in paths:
+                self.insert_image(QImage(pth))
+            return
+        if source.hasImage() and not source.hasHtml():
+            data = source.imageData()
+            img = data if isinstance(data, QImage) else (data.toImage() if hasattr(data, "toImage") else None)
+            if self.insert_image(img):
+                return
         fmt = self.currentCharFormat()
         if fmt.hasProperty(CITE_PROP):
             fmt.clearProperty(CITE_PROP)
@@ -904,6 +1037,7 @@ class MainWindow(QMainWindow):
         if self.style_name not in STYLE_NAMES:
             self.style_name = "APA 7"
         self.theme = MOCHA if self.settings.value("theme", "dark") == "dark" else LATTE
+        self.aesthetic = str(self.settings.value("aesthetic", "false")).lower() == "true"
 
         self.editor = Editor()
         self.setCentralWidget(self.editor)
@@ -1078,6 +1212,14 @@ class MainWindow(QMainWindow):
         self.a_indent = self._act("→", lambda: self.indent(1), None, False, "Increase indent")
         self.a_outdent = self._act("←", lambda: self.indent(-1), None, False, "Decrease indent")
 
+        self.a_image = self._act("Image", self.insert_image_dialog, "Ctrl+Shift+I", tip="Insert image")
+        self.a_resize = self._act("Resize image…", self.resize_image)
+        self.a_aesthetic = self._act("Aesthetic", self.set_aesthetic, "Ctrl+Shift+A", True,
+                                     "Syntax-style Catppuccin text colours (view only)")
+        self.a_aesthetic.blockSignals(True)
+        self.a_aesthetic.setChecked(self.aesthetic)
+        self.a_aesthetic.blockSignals(False)
+
         self.a_cite = self._act("Insert citation", self.insert_citation, "Ctrl+Alt+C")
         self.a_bib = self._act("Insert / update bibliography", self.update_bibliography, "Ctrl+Alt+B")
         self.a_refresh = self._act("Refresh citations", self.refresh_citations)
@@ -1141,6 +1283,10 @@ class MainWindow(QMainWindow):
         fb.addSeparator()
         for a in (self.a_bullets, self.a_numbers, self.a_outdent, self.a_indent):
             fb.addAction(a)
+        fb.addSeparator()
+        fb.addAction(self.a_image)
+        fb.addAction(self.a_aesthetic)
+        self.editor.imageActivated.connect(self.resize_image)
 
     def _build_menus(self):
         mb = self.menuBar()
@@ -1159,6 +1305,9 @@ class MainWindow(QMainWindow):
         m.addAction(self._act("Select all", self.editor.selectAll, "Ctrl+A"))
         m.addSeparator()
         m.addAction(self.a_find)
+        m = mb.addMenu("&Insert")
+        m.addAction(self.a_image)
+        m.addAction(self.a_resize)
         m = mb.addMenu("&Cite")
         for a in (self.a_cite, self.a_bib, self.a_refresh, None, self.a_add_ref, self.a_import, self.a_doi):
             m.addSeparator() if a is None else m.addAction(a)
@@ -1174,6 +1323,7 @@ class MainWindow(QMainWindow):
         self.style_actions = grp
         self.view_menu = mb.addMenu("&View")
         self.view_menu.addAction(self.a_theme)
+        self.view_menu.addAction(self.a_aesthetic)
 
     def _build_dock(self):
         dock = QDockWidget("References", self)
@@ -1602,10 +1752,91 @@ class MainWindow(QMainWindow):
         cur.endEditBlock()
         self.update_highlights()
 
+    # ---- images
+    def insert_image_dialog(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "Insert image", "",
+                                                "Images (*.png *.jpg *.jpeg *.gif *.bmp *.webp)")
+        for pth in paths:
+            img = QImage(pth)
+            if not self.editor.insert_image(img):
+                QMessageBox.warning(self, APP_NAME, f"Could not read image:\n{pth}")
+        self.editor.setFocus()
+
+    def resize_image(self):
+        cur = self.editor.textCursor()
+        c = None
+        if cur.hasSelection():
+            pos = min(cur.anchor(), cur.position())
+            probe = QTextCursor(cur)
+            probe.setPosition(pos)
+            probe.setPosition(pos + 1, QTextCursor.MoveMode.KeepAnchor)
+            if probe.charFormat().isImageFormat():
+                c = probe
+        if c is None:
+            c = self.editor.image_at_cursor(cur)
+        if c is None:
+            self.statusBar().showMessage("Place the cursor next to an image (or double-click it)", 4000)
+            return
+        imf = c.charFormat().toImageFormat()
+        w, h = imf.width() or 1, imf.height() or 1
+        nw, ok = QInputDialog.getInt(self, "Resize image", "Width (px):", int(w), 20, 4000)
+        if ok:
+            imf.setWidth(nw)
+            imf.setHeight(max(1, round(h * nw / w)))
+            c.setCharFormat(imf)
+
+    # ---- aesthetic (syntax-style colours, display only)
+    def set_aesthetic(self, on):
+        self.aesthetic = bool(on)
+        self.settings.setValue("aesthetic", "true" if on else "false")
+        self.update_highlights()
+
+    def _aesthetic_selections(self):
+        t, doc, out = self.theme, self.editor.document(), []
+
+        def add(start, length, color):
+            if length <= 0:
+                return
+            c = QTextCursor(doc)
+            c.setPosition(start)
+            c.setPosition(start + length, QTextCursor.MoveMode.KeepAnchor)
+            f = QTextCharFormat()
+            f.setForeground(QColor(color))
+            sel = QTextEdit.ExtraSelection()
+            sel.cursor = c
+            sel.format = f
+            out.append(sel)
+
+        block = doc.begin()
+        while block.isValid() and len(out) < 20000:
+            text, base, bf = block.text(), block.position(), block.blockFormat()
+            if bf.headingLevel():
+                add(base, len(text), t["mauve"])
+            else:
+                if bf.hasProperty(BIB_PROP):
+                    add(base, len(text), t["subtext1"])
+                for m in PAREN_RE.finditer(text):
+                    add(base + m.start(), m.end() - m.start(), t["sapphire"])
+                it = block.begin()
+                while not it.atEnd():
+                    fr = it.fragment()
+                    fm = fr.charFormat()
+                    if not fm.hasProperty(CITE_PROP) and fm.foreground().style() == Qt.BrushStyle.NoBrush:
+                        if fm.fontWeight() >= 600:
+                            add(fr.position(), fr.length(), t["maroon"])
+                        elif fm.fontItalic():
+                            add(fr.position(), fr.length(), t["pink"])
+                    it += 1
+                for rx, key in ((NUM_RE, "peach"), (CAPS_RE, "yellow"), (QUOTE_RE, "green"), (URL_RE, "teal")):
+                    for m in rx.finditer(text):
+                        add(base + m.start(), m.end() - m.start(), t[key])
+            block = block.next()
+        return out
+
     def update_highlights(self):
-        sels = []
-        col = QColor(self.theme["mauve"])
-        col.setAlpha(55)
+        sels = self._aesthetic_selections() if self.aesthetic else []
+        bg = QColor(self.theme["mauve"] if not self.aesthetic else self.theme["blue"])
+        bg.setAlpha(55)
         doc = self.editor.document()
         for pos, length, _, _ in self.collect_spans():
             s = QTextEdit.ExtraSelection()
@@ -1613,7 +1844,9 @@ class MainWindow(QMainWindow):
             c.setPosition(pos)
             c.setPosition(pos + length, QTextCursor.MoveMode.KeepAnchor)
             f = QTextCharFormat()
-            f.setBackground(col)
+            f.setBackground(bg)
+            if self.aesthetic:
+                f.setForeground(QColor(self.theme["blue"]))
             s.cursor = c
             s.format = f
             sels.append(s)
