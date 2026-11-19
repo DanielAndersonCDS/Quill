@@ -22,20 +22,27 @@ import uuid
 from pathlib import Path
 from xml.sax.saxutils import quoteattr
 
-from PySide6.QtCore import (QBuffer, QIODevice, QMarginsF, QSettings, QStandardPaths, Qt,
+from PySide6.QtCore import (QBuffer, QIODevice, QMarginsF, QMimeData, QSettings, QStandardPaths, Qt,
                             QTimer, QUrl, Signal)
-from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QImage, QKeySequence,
-                           QPageLayout, QPageSize, QPdfWriter, QPixmap, QTextBlockFormat,
-                           QTextCharFormat, QTextCursor, QTextDocument, QTextImageFormat,
-                           QTextListFormat)
+from PySide6.QtGui import (QAction, QActionGroup, QColor, QFont, QIcon, QImage, QKeySequence,
+                           QPageLayout, QPageSize, QPainter, QPdfWriter, QPixmap, QTextBlockFormat,
+                           QTextCharFormat, QTextCursor, QTextDocument, QTextFormat,
+                           QTextImageFormat, QTextListFormat)
 from PySide6.QtWidgets import (QApplication, QColorDialog, QComboBox, QDialog,
                                QDialogButtonBox, QDockWidget, QFileDialog,
                                QFontComboBox, QFormLayout, QFrame, QHBoxLayout,
-                               QInputDialog, QLabel, QLineEdit, QListWidget,
-                               QListWidgetItem, QMainWindow, QMessageBox,
-                               QPlainTextEdit, QPushButton, QSizePolicy, QTextEdit, QVBoxLayout,
-                               QWidget)
+                               QDoubleSpinBox, QInputDialog, QLabel, QLineEdit, QListWidget,
+                               QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+                               QPlainTextEdit, QPushButton, QSizePolicy, QSpinBox, QTextEdit,
+                               QToolButton, QVBoxLayout, QWidget)
 
+from quill_paste import looks_structured, parse as parse_pasted
+from quill_paste.apply import apply_blocks, make_table_format
+from quill_themes import load_themes
+from quill_layout import (MARGIN_PRESETS, PAGE_SIZES, PageSetup, apply_page_setup,
+                          read_page_setup)
+from quill_layout_ui import (borders_dialog, columns_dialog, export_pdf as render_pdf,
+                             header_footer_dialog, margins_dialog, paint_decor)
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import parse_xml
@@ -53,6 +60,8 @@ HEADING_SIZES = {1: 20, 2: 16, 3: 13, 4: 12, 5: 11, 6: 11}
 # Custom QTextFormat property ids (QTextFormat.UserProperty == 0x100000)
 CITE_PROP = 0x100000 + 1   # on a char format: JSON of the citation
 BIB_PROP = 0x100000 + 2    # on a block format: block belongs to the bibliography
+MATH_PROP = 0x100000 + 3   # on a char format: converted LaTeX (skipped by aesthetic colouring)
+BOX_PROP = 0x100000 + 4    # on a char format: \\boxed result (Word run border)
 
 # Mendeley Cite content-control layout
 TAG_PREFIX = "MENDELEY_CITATION_v3_"
@@ -79,8 +88,21 @@ LATTE = dict(
     overlay0="#9ca0b0", surface2="#acb0be", surface1="#bcc0cc", surface0="#ccd0da",
     base="#eff1f5", mantle="#e6e9ef", crust="#dce0e8", accent_bg="rgba(136,57,239,0.14)")
 
-MOCHA.update(sapphire="#74c7ec", sky="#89dceb", maroon="#eba0ac", flamingo="#f2cdcd")
-LATTE.update(sapphire="#209fb5", sky="#04a5e5", maroon="#e64553", flamingo="#dd7878")
+MOCHA.update(sapphire="#74c7ec", sky="#89dceb", maroon="#eba0ac", flamingo="#f2cdcd",
+             accent_text="#1e1e2e", label="Catppuccin Mocha", dark=True)
+LATTE.update(sapphire="#209fb5", sky="#04a5e5", maroon="#e64553", flamingo="#dd7878",
+             accent_text="#eff1f5", label="Catppuccin Latte", dark=False)
+
+# Extra themes: any devkit-style JSON in ./themes (see quill_themes.py)
+THEMES = {"dark": MOCHA, "light": LATTE}
+# Frozen (PyInstaller) builds keep bundled data in sys._MEIPASS; users add their own themes
+# in a "themes" folder next to Quill.exe.
+BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+USER_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else BASE_DIR
+_extra, THEME_PROBLEMS = load_themes(BASE_DIR / "themes")
+if USER_DIR != BASE_DIR:
+    _extra.update(load_themes(USER_DIR / "themes")[0])
+THEMES.update(_extra)
 
 IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
 A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -121,7 +143,7 @@ QComboBox QAbstractItemView { background: @base@; border: 1px solid @surface0@;
             selection-background-color: @surface0@; selection-color: @text@; outline: 0; }
 QPushButton { background: @surface0@; border: none; border-radius: 8px; padding: 7px 14px; color: @text@; }
 QPushButton:hover { background: @surface1@; }
-QPushButton#primary { background: @mauve@; color: @base@; font-weight: 600; }
+QPushButton#primary { background: @mauve@; color: @accent_text@; font-weight: 600; }
 QPushButton#primary:hover { background: @lavender@; }
 QListWidget { background: @base@; border: 1px solid @surface0@; border-radius: 10px; padding: 4px; outline: 0; }
 QListWidget::item { padding: 8px 10px; border-radius: 7px; color: @subtext1@; }
@@ -525,6 +547,11 @@ def _apply_run_format(run, fmt, heading):
         f.superscript = True
     elif va == QTextCharFormat.VerticalAlignment.AlignSubScript:
         f.subscript = True
+    if fmt.boolProperty(BOX_PROP):
+        rPr = run._r.get_or_add_rPr()
+        bdr = parse_xml(f'<w:bdr {nsdecls("w")} w:val="single" w:sz="4" w:space="1" w:color="auto"/>')
+        va_el = rPr.find(qn("w:vertAlign"))  # schema order: bdr comes before vertAlign
+        va_el.addprevious(bdr) if va_el is not None else rPr.append(bdr)
 
 
 def _citation_sdt(par, cit_json, text, fmt, heading):
@@ -573,14 +600,12 @@ def _write_image(qdoc, par, imf):
     par.add_run().add_picture(io.BytesIO(bytes(buf.data())), width=Pt(wp), height=Pt(hp))
 
 
-def write_docx(qdoc, path):
+def write_docx(qdoc, path, page=None):
     d = Document()
     normal = d.styles["Normal"]
     normal.font.name = DEFAULT_FONT
     normal.font.size = Pt(DEFAULT_SIZE)
-    sec = d.sections[0]
-    sec.page_width, sec.page_height = Mm(210), Mm(297)
-    sec.left_margin = sec.right_margin = sec.top_margin = sec.bottom_margin = Mm(25.4)
+    apply_page_setup(d, page or PageSetup())
 
     bib = []
 
@@ -598,8 +623,16 @@ def write_docx(qdoc, path):
 
     bullets = (QTextListFormat.Style.ListDisc, QTextListFormat.Style.ListCircle,
                QTextListFormat.Style.ListSquare)
+    nums = {}  # first block position of a numbered QTextList -> restarted w:numId
     block = qdoc.begin()
     while block.isValid():
+        table = QTextCursor(block).currentTable()
+        if table is not None:
+            flush()
+            _write_table(qdoc, d, table)
+            while block.isValid() and block.position() <= table.lastPosition():
+                block = block.next()
+            continue
         bf = block.blockFormat()
         is_bib = bf.hasProperty(BIB_PROP)
         if not is_bib:
@@ -609,7 +642,19 @@ def write_docx(qdoc, path):
         if lvl:
             par = d.add_paragraph(style=f"Heading {min(lvl, 4)}")
         elif tl:
-            par = d.add_paragraph(style="List Bullet" if tl.format().style() in bullets else "List Number")
+            lf = tl.format()
+            depth = max(0, min(2, lf.indent() - 1))
+            is_bullet = lf.style() in bullets
+            style = ("List Bullet" if is_bullet else "List Number") + (f" {depth + 1}" if depth else "")
+            par = d.add_paragraph(style=style)
+            if not is_bullet and depth == 0:
+                key = tl.item(0).position()
+                if key not in nums:
+                    nums[key] = _new_list_num(d, "List Number")
+                if nums[key]:
+                    numPr = par._p.get_or_add_pPr().get_or_add_numPr()
+                    numPr.get_or_add_numId().val = nums[key]
+                    numPr.get_or_add_ilvl().val = 0
         else:
             par = d.add_paragraph()
         al = bf.alignment()
@@ -624,28 +669,98 @@ def write_docx(qdoc, path):
                 par.paragraph_format.left_indent = Pt(bf.leftMargin() * 0.75)
             if bf.textIndent():
                 par.paragraph_format.first_line_indent = Pt(bf.textIndent() * 0.75)
-
-        it = block.begin()
-        while not it.atEnd():
-            frag = it.fragment()
-            fmt = frag.charFormat()
-            if fmt.isImageFormat():
-                _write_image(qdoc, par, fmt.toImageFormat())
-                it += 1
-                continue
-            text = frag.text().replace("\ufffc", "")
-            if text:
-                if fmt.hasProperty(CITE_PROP):
-                    _citation_sdt(par, fmt.stringProperty(CITE_PROP), text, fmt, lvl)
-                else:
-                    run = par.add_run(text.replace("\u2028", "\n"))
-                    _apply_run_format(run, fmt, lvl)
-            it += 1
+        pf = par.paragraph_format
+        if bf.rightMargin():
+            pf.right_indent = Pt(bf.rightMargin() * 0.75)
+        if not lvl:  # headings keep their Word style spacing
+            if bf.topMargin():
+                pf.space_before = Pt(bf.topMargin() * 0.75)
+            if bf.bottomMargin() != 8:
+                pf.space_after = Pt(bf.bottomMargin() * 0.75)
+        if bf.pageBreakPolicy() & QTextFormat.PageBreakFlag.PageBreak_AlwaysBefore:
+            pf.page_break_before = True
+        if bf.layoutDirection() == Qt.LayoutDirection.RightToLeft:
+            _set_bidi(par)
+        _fill_par(qdoc, par, block, lvl)
         if is_bib:
             bib.append(par._p)
         block = block.next()
     flush()
     d.save(path)
+
+
+def _set_bidi(par):
+    """Mark a paragraph right-to-left, keeping w:pPr children in schema order."""
+    pPr = par._p.get_or_add_pPr()
+    if pPr.find(qn("w:bidi")) is not None:
+        return
+    later = ("adjustRightInd snapToGrid spacing ind contextualSpacing mirrorIndents suppressOverlap "
+             "jc textDirection textAlignment textboxTightWrap outlineLvl divId cnfStyle rPr "
+             "sectPr pPrChange").split()
+    el = parse_xml(f'<w:bidi {nsdecls("w")}/>')
+    for child in pPr:
+        if child.tag.split("}")[1] in later:
+            child.addprevious(el)
+            return
+    pPr.append(el)
+
+
+def _fill_par(qdoc, par, block, lvl):
+    """Copy a block's text fragments (runs, images, citations) into a docx paragraph."""
+    it = block.begin()
+    while not it.atEnd():
+        frag = it.fragment()
+        fmt = frag.charFormat()
+        if fmt.isImageFormat():
+            _write_image(qdoc, par, fmt.toImageFormat())
+            it += 1
+            continue
+        text = frag.text().replace("\ufffc", "")
+        if text:
+            if fmt.hasProperty(CITE_PROP):
+                _citation_sdt(par, fmt.stringProperty(CITE_PROP), text, fmt, lvl)
+            else:
+                run = par.add_run(text.replace("\u2028", "\n"))
+                _apply_run_format(run, fmt, lvl)
+        it += 1
+
+
+def _new_list_num(d, style_name):
+    """Create a w:num that restarts at 1 but reuses `style_name`'s list layout."""
+    try:
+        numbering = d.part.numbering_part.element
+        base = d.styles[style_name].element.pPr.numPr.numId.val
+        absid = numbering.xpath(f'./w:num[@w:numId="{base}"]/w:abstractNumId/@w:val')[0]
+        new_id = max(int(x) for x in numbering.xpath("./w:num/@w:numId")) + 1
+        num = parse_xml(
+            f'<w:num {nsdecls("w")} w:numId="{new_id}"><w:abstractNumId w:val="{absid}"/>'
+            f'<w:lvlOverride w:ilvl="0"><w:startOverride w:val="1"/></w:lvlOverride></w:num>')
+        tail = numbering.find(qn("w:numIdMacAtCleanup"))
+        tail.addprevious(num) if tail is not None else numbering.append(num)
+        return new_id
+    except Exception:
+        return None
+
+
+def _write_table(qdoc, d, table):
+    t = d.add_table(rows=table.rows(), cols=table.columns())
+    try:
+        t.style = "Table Grid"
+    except Exception:
+        pass
+    for r in range(table.rows()):
+        for c in range(table.columns()):
+            cell = table.cellAt(r, c)
+            if cell.row() != r or cell.column() != c:
+                continue  # covered by a merged cell
+            dcell, first = t.cell(r, c), True
+            b = cell.firstCursorPosition().block()
+            end = cell.lastCursorPosition().position()
+            while b.isValid() and b.position() <= end:
+                par = dcell.paragraphs[0] if first else dcell.add_paragraph()
+                first = False
+                _fill_par(qdoc, par, b, 0)
+                b = b.next()
 
 
 def _list_kind(d, p_el):
@@ -671,7 +786,7 @@ def read_docx(path, qdoc, lib):
     qdoc.clear()
     qdoc.setDefaultFont(QFont(DEFAULT_FONT, DEFAULT_SIZE))
     cur = QTextCursor(qdoc)
-    state = {"first": True, "list": None, "kind": None}
+    state = {"first": True, "list": None, "key": None}
 
     def start_block(bf):
         if state["first"]:
@@ -707,6 +822,9 @@ def read_docx(path, qdoc, lib):
             f.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignSuperScript)
         elif run.font.subscript:
             f.setVerticalAlignment(QTextCharFormat.VerticalAlignment.AlignSubScript)
+        rPr = run._r.rPr
+        if rPr is not None and rPr.find(qn("w:bdr")) is not None:
+            f.setProperty(BOX_PROP, True)
         return f
 
     def register(cit):
@@ -787,13 +905,41 @@ def read_docx(path, qdoc, lib):
                     bf.setTextIndent(pf.first_line_indent.pt / 0.75)
             except Exception:
                 pass
+        try:
+            if pf.right_indent:
+                bf.setRightMargin(pf.right_indent.pt / 0.75)
+            if not level:
+                if pf.space_before is not None:
+                    bf.setTopMargin(pf.space_before.pt / 0.75)
+                if pf.space_after is not None:
+                    bf.setBottomMargin(pf.space_after.pt / 0.75)
+            if pf.page_break_before:
+                bf.setPageBreakPolicy(QTextFormat.PageBreakFlag.PageBreak_AlwaysBefore)
+            if el.pPr is not None and el.pPr.find(qn("w:bidi")) is not None:
+                bf.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        except Exception:
+            pass
         start_block(bf)
         if kind:
-            if state["list"] is None or state["kind"] != kind:
+            pPr = el.pPr
+            numpr = pPr.numPr if pPr is not None else None
+            num_id = numpr.numId.val if numpr is not None and numpr.numId is not None else 0
+            depth = re.search(r"(\d)$", name or "")
+            if depth:
+                lvl = int(depth.group(1)) - 1
+            else:
+                lvl = numpr.ilvl.val if numpr is not None and numpr.ilvl is not None else 0
+            lvl = max(0, min(int(lvl), 2))
+            key = (kind, lvl, num_id)
+            if state["list"] is None or state["key"] != key:
                 lf = QTextListFormat()
-                lf.setStyle(QTextListFormat.Style.ListDisc if kind == "bullet" else QTextListFormat.Style.ListDecimal)
+                lf.setIndent(lvl + 1)
+                if kind == "bullet":
+                    lf.setStyle(QTextListFormat.Style.ListDisc if lvl == 0 else QTextListFormat.Style.ListCircle)
+                else:
+                    lf.setStyle(QTextListFormat.Style.ListDecimal)
                 state["list"] = cur.createList(lf)
-                state["kind"] = kind
+                state["key"] = key
             else:
                 state["list"].add(cur.block())
         else:
@@ -835,10 +981,28 @@ def read_docx(path, qdoc, lib):
 
     def table(el):
         t = Table(el, d._body)
-        for row in t.rows:
-            start_block(default_bf())
-            state["list"] = None
-            cur.insertText("\t".join(c.text.replace("\n", " ") for c in row.cells))
+        nrows, ncols = len(t.rows), len(t.columns)
+        if not nrows or not ncols:
+            return
+        if not state["first"]:
+            cur.insertBlock(default_bf(), QTextCharFormat())
+        state["list"] = None
+        qt = cur.insertTable(nrows, ncols, make_table_format())
+        for ri, row in enumerate(t.rows):
+            cells = row.cells
+            for ci in range(min(ncols, len(cells))):
+                if ci and cells[ci]._tc is cells[ci - 1]._tc:
+                    continue  # merged cell: write its text once
+                c = qt.cellAt(ri, ci).firstCursorPosition()
+                for pi, p in enumerate(cells[ci].paragraphs):
+                    if pi:
+                        c.insertText("\u2028")
+                    for r in p.runs:
+                        c.insertText(r.text.replace("\n", "\u2028"), run_fmt(r, 0))
+        end = qt.lastCursorPosition()
+        end.movePosition(QTextCursor.MoveOperation.NextBlock)
+        cur.setPosition(end.position())
+        state["first"] = True  # the empty block after the table is reused by the next paragraph
 
     def process(el, bib=False):
         if el.tag == qn("w:p"):
@@ -858,6 +1022,7 @@ def read_docx(path, qdoc, lib):
     lib.save()
     qdoc.clearUndoRedoStacks()
     qdoc.setModified(False)
+    return read_page_setup(d)
 
 
 # --------------------------------------------------------------------------- widgets
@@ -912,14 +1077,43 @@ class Editor(QTextEdit):
 
     def __init__(self):
         super().__init__()
+        self.smart_paste = True
+        self.page = PageSetup()
         self.setAcceptRichText(True)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setTabStopDistance(40)
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
+        self._update_viewport_margins()
+
+    def _update_viewport_margins(self):
         m = max(28, (self.width() - self.PAGE_WIDTH) // 2)
         self.setViewportMargins(m, 18, m, 18)
+
+    def apply_page(self, ps):
+        """Show a PageSetup: page width, text margins, and the decorations painted on top."""
+        self.page = ps
+        k = 96 / 25.4
+        self.PAGE_WIDTH = max(360, int(ps.eff_w * k))
+        root = self.document().rootFrame()
+        ff = root.frameFormat()
+        ff.setLeftMargin(ps.left * k)
+        ff.setRightMargin(ps.right * k)
+        ff.setTopMargin(ps.top * k)
+        ff.setBottomMargin(ps.bottom * k)
+        root.setFrameFormat(ff)
+        self._scan_key = None
+        self._update_viewport_margins()
+        self.viewport().update()
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        p = QPainter(self.viewport())
+        try:
+            paint_decor(self, p)
+        finally:
+            p.end()
 
     def insertFromMimeData(self, source):
         paths = self._image_paths(source)
@@ -932,11 +1126,49 @@ class Editor(QTextEdit):
             img = data if isinstance(data, QImage) else (data.toImage() if hasattr(data, "toImage") else None)
             if self.insert_image(img):
                 return
+        if self.smart_paste and source.hasText() and not self._is_office_html(source):
+            text = source.text()
+            if looks_structured(text) and self.smart_insert(text):
+                return
         fmt = self.currentCharFormat()
         if fmt.hasProperty(CITE_PROP):
             fmt.clearProperty(CITE_PROP)
             self.setCurrentCharFormat(fmt)
         super().insertFromMimeData(source)
+
+    @staticmethod
+    def _is_office_html(source):
+        """Word/PowerPoint HTML is already formatted: let Qt paste it as-is."""
+        return source.hasHtml() and "microsoft" in source.html()[:4000].lower()
+
+    def smart_insert(self, text, cursor=None):
+        """Format raw markdown/LaTeX/table text into real blocks. One undo step.
+
+        Returns False (and leaves the document untouched) if anything goes wrong,
+        so callers can fall back to a normal paste."""
+        blocks = parse_pasted(text)
+        if not blocks:
+            return False
+        cur = QTextCursor(cursor) if cursor is not None else self.textCursor()
+        if cur.currentTable() is not None:
+            return False  # pasting structure inside a table cell: use the normal paste
+        doc = self.document()
+        undo_before = doc.availableUndoSteps()
+        try:
+            apply_blocks(cur, blocks, default_bf, HEADING_SIZES)
+        except Exception as e:  # pragma: no cover - Qt-side safety net
+            print("smart paste failed:", e, file=sys.stderr)
+            while doc.availableUndoSteps() > undo_before:
+                doc.undo()
+            return False
+        self.setTextCursor(cur)
+        self.ensureCursorVisible()
+        return True
+
+    def paste_plain(self):
+        md = QMimeData()
+        md.setText(QApplication.clipboard().text())
+        QTextEdit.insertFromMimeData(self, md)
 
     def keyPressEvent(self, e):
         if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -1036,10 +1268,11 @@ class MainWindow(QMainWindow):
         self.style_name = self.settings.value("citation_style", "APA 7")
         if self.style_name not in STYLE_NAMES:
             self.style_name = "APA 7"
-        self.theme = MOCHA if self.settings.value("theme", "dark") == "dark" else LATTE
+        self.theme = THEMES.get(str(self.settings.value("theme", "dark")), MOCHA)
         self.aesthetic = str(self.settings.value("aesthetic", "false")).lower() == "true"
 
         self.editor = Editor()
+        self.editor.smart_paste = str(self.settings.value("smart_paste", "true")).lower() == "true"
         self.setCentralWidget(self.editor)
         self.resize(1280, 820)
         self._reset_doc()
@@ -1073,6 +1306,9 @@ class MainWindow(QMainWindow):
         cur.setBlockFormat(default_bf())
         doc.clearUndoRedoStacks()
         doc.setModified(False)
+        self.page = PageSetup()
+        self.editor.apply_page(self.page)
+        self._sync_layout_ui()
 
     def _update_title(self):
         name = Path(self.path).name if self.path else "Untitled"
@@ -1107,7 +1343,9 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            read_docx(path, self.editor.document(), self.lib)
+            self.page = read_docx(path, self.editor.document(), self.lib)
+            self.editor.apply_page(self.page)
+            self._sync_layout_ui()
         except Exception as e:
             QMessageBox.critical(self, APP_NAME, f"Could not open the file:\n{e}")
             return
@@ -1131,7 +1369,7 @@ class MainWindow(QMainWindow):
 
     def _write(self, path):
         try:
-            write_docx(self.editor.document(), path)
+            write_docx(self.editor.document(), path, self.page)
         except Exception as e:
             QMessageBox.critical(self, APP_NAME, f"Could not save the file:\n{e}")
             return False
@@ -1149,10 +1387,7 @@ class MainWindow(QMainWindow):
         if not path.lower().endswith(".pdf"):
             path += ".pdf"
         try:
-            w = QPdfWriter(path)
-            w.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
-            w.setPageMargins(QMarginsF(20, 20, 20, 20), QPageLayout.Unit.Millimeter)
-            self.editor.document().clone().print_(w)
+            render_pdf(self.editor.document(), path, self.page, self.editor.font())
         except Exception as e:
             QMessageBox.critical(self, APP_NAME, f"Could not export PDF:\n{e}")
             return
@@ -1162,6 +1397,8 @@ class MainWindow(QMainWindow):
         if self.maybe_save():
             self.settings.setValue("theme", self.theme["name"])
             self.settings.setValue("citation_style", self.style_name)
+            self.settings.setValue("show_refs", "false" if self.dock.isHidden() else "true")
+            self.settings.setValue("show_layout", "false" if self.layout_tb.isHidden() else "true")
             e.accept()
         else:
             e.ignore()
@@ -1180,6 +1417,14 @@ class MainWindow(QMainWindow):
             a.setToolTip(tip + (f"  ({shortcut})" if shortcut else ""))
         return a
 
+    def _radio(self, text, slot, group):
+        """Checkable action in an exclusive group; fires only when the user picks it."""
+        a = QAction(text, self)
+        a.setCheckable(True)
+        a.triggered.connect(lambda _=False: slot())
+        group.addAction(a)
+        return a
+
     def _build_actions(self):
         ed = self.editor
         self.a_new = self._act("New", self.new_doc, "Ctrl+N")
@@ -1190,7 +1435,7 @@ class MainWindow(QMainWindow):
         self.a_undo = self._act("Undo", ed.undo, "Ctrl+Z")
         self.a_redo = self._act("Redo", ed.redo, "Ctrl+Y")
         self.a_find = self._act("Find…", self.find_text, "Ctrl+F")
-        self.a_theme = self._act("Theme", self.toggle_theme, "Ctrl+Shift+T", tip="Switch light / dark")
+        self.a_theme = self._act("Theme", self.toggle_theme, "Ctrl+Shift+T", tip="Next theme")
 
         self.a_bold = self._act("B", lambda c: self.merge_fmt(self._fmt(weight=700 if c else 400)), "Ctrl+B", True, "Bold")
         self.a_italic = self._act("I", lambda c: self.merge_fmt(self._fmt(italic=c)), "Ctrl+I", True, "Italic")
@@ -1238,6 +1483,11 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         tb.addAction(self.a_cite)
         tb.addAction(self.a_bib)
+        self.refs_btn = QToolButton()
+        self.refs_btn.setText("References")
+        self.refs_btn.setCheckable(True)
+        self.refs_btn.setToolTip("Show / hide the References panel (Ctrl+Shift+R)")
+        tb.addWidget(self.refs_btn)
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         tb.addWidget(spacer)
@@ -1287,6 +1537,7 @@ class MainWindow(QMainWindow):
         fb.addAction(self.a_image)
         fb.addAction(self.a_aesthetic)
         self.editor.imageActivated.connect(self.resize_image)
+        self._build_layout_toolbar()
 
     def _build_menus(self):
         mb = self.menuBar()
@@ -1302,12 +1553,37 @@ class MainWindow(QMainWindow):
         m.addAction(self._act("Cut", self.editor.cut, "Ctrl+X"))
         m.addAction(self._act("Copy", self.editor.copy, "Ctrl+C"))
         m.addAction(self._act("Paste", self.editor.paste, "Ctrl+V"))
+        m.addAction(self._act("Paste as plain text", self.editor.paste_plain, "Ctrl+Shift+V"))
+        self.a_smart = self._act("Smart paste (auto-format markdown / LaTeX / tables)",
+                                 self.set_smart_paste, None, True)
+        self.a_smart.blockSignals(True)
+        self.a_smart.setChecked(self.editor.smart_paste)
+        self.a_smart.blockSignals(False)
+        m.addAction(self.a_smart)
+        m.addAction(self._act("Format selection as document", self.format_selection, "Ctrl+Alt+F"))
         m.addAction(self._act("Select all", self.editor.selectAll, "Ctrl+A"))
         m.addSeparator()
         m.addAction(self.a_find)
         m = mb.addMenu("&Insert")
         m.addAction(self.a_image)
         m.addAction(self.a_resize)
+        m.addSeparator()
+        m.addAction(self.a_hf)
+        m.addAction(self.a_pageno)
+        m.addMenu(self.m_watermark)
+        m.addAction(self.a_borders)
+        m.addAction(self.a_pagebreak)
+        lm = mb.addMenu("&Layout")
+        for sub in (self.m_margins, self.m_orient, self.m_size, self.m_cols, self.m_dir):
+            lm.addMenu(sub)
+        lm.addSeparator()
+        lm.addAction(self.a_pagebreak)
+        lm.addAction(self.a_linenos)
+        lm.addAction(self.a_hyphen)
+        lm.addSeparator()
+        lm.addAction(self.a_hf)
+        lm.addMenu(self.m_watermark)
+        lm.addAction(self.a_borders)
         m = mb.addMenu("&Cite")
         for a in (self.a_cite, self.a_bib, self.a_refresh, None, self.a_add_ref, self.a_import, self.a_doi):
             m.addSeparator() if a is None else m.addAction(a)
@@ -1323,11 +1599,23 @@ class MainWindow(QMainWindow):
         self.style_actions = grp
         self.view_menu = mb.addMenu("&View")
         self.view_menu.addAction(self.a_theme)
+        tm = self.view_menu.addMenu("Theme")
+        tgrp = QActionGroup(self)
+        self.theme_actions = {}
+        for tid, pal in THEMES.items():
+            a = QAction(pal.get("label", tid), self, checkable=True)
+            a.setChecked(tid == self.theme["name"])
+            a.triggered.connect(lambda _=False, tid=tid: self.apply_theme(THEMES[tid]))
+            tgrp.addAction(a)
+            tm.addAction(a)
+            self.theme_actions[tid] = a
+        self.view_menu.addAction(self.layout_tb.toggleViewAction())
+        self.layout_tb.toggleViewAction().setText("Layout toolbar")
         self.view_menu.addAction(self.a_aesthetic)
 
     def _build_dock(self):
         dock = QDockWidget("References", self)
-        dock.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
+        dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetClosable)
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.setContentsMargins(12, 10, 12, 12)
@@ -1372,18 +1660,31 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
         self.dock = dock
         self.view_menu.addAction(dock.toggleViewAction())
-        dock.toggleViewAction().setText("References panel")
+        tv = dock.toggleViewAction()
+        tv.setText("References panel")
+        tv.setShortcut("Ctrl+Shift+R")
+        tv.setToolTip("Show / hide the References panel (Ctrl+Shift+R)")
+        dock.setVisible(str(self.settings.value("show_refs", "true")).lower() == "true")
         self.refresh_library_list()
+        self.refs_btn.setChecked(not dock.isHidden())
+        self.refs_btn.toggled.connect(dock.setVisible)
+        dock.visibilityChanged.connect(self.refs_btn.setChecked)
 
     # ---- theme
     def apply_theme(self, theme):
         self.theme = theme
         QApplication.instance().setStyleSheet(build_qss(theme))
         self.settings.setValue("theme", theme["name"])
+        act = getattr(self, "theme_actions", {}).get(theme["name"])
+        if act is not None and not act.isChecked():
+            act.setChecked(True)
         self.update_highlights()
 
     def toggle_theme(self):
-        self.apply_theme(LATTE if self.theme is MOCHA else MOCHA)
+        """Cycle through every available theme."""
+        names = list(THEMES)
+        nxt = names[(names.index(self.theme["name"]) + 1) % len(names)] if self.theme["name"] in names else names[0]
+        self.apply_theme(THEMES[nxt])
 
     # ---- formatting helpers
     def _fmt(self, family=None, size=None, weight=None, italic=None, underline=None, strike=None, valign=None):
@@ -1475,6 +1776,7 @@ class MainWindow(QMainWindow):
             cur.setBlockFormat(bf)
 
     def sync_format(self):
+        self._sync_para_spins()
         fmt = self.editor.currentCharFormat()
         cur = self.editor.textCursor()
         pairs = ((self.a_bold, fmt.fontWeight() >= 600), (self.a_italic, fmt.fontItalic()),
@@ -1785,6 +2087,255 @@ class MainWindow(QMainWindow):
             imf.setHeight(max(1, round(h * nw / w)))
             c.setCharFormat(imf)
 
+    # ---- page layout (Word's Layout tab)
+    def _menu(self, title):
+        m = QMenu(title, self)
+        return m
+
+    def _tool_menu(self, tb, text, menu, tip):
+        b = QToolButton()
+        b.setText(text + " ▾")
+        b.setToolTip(tip)
+        b.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        b.setMenu(menu)
+        tb.addWidget(b)
+        return b
+
+    def _build_layout_toolbar(self):
+        self.addToolBarBreak()
+        tb = self.addToolBar("Layout")
+        tb.setMovable(False)
+        self.layout_tb = tb
+
+        self.m_margins = self._menu("Margins")
+        for name, (t, b, l, r) in MARGIN_PRESETS.items():
+            self.m_margins.addAction(self._act(
+                f"{name}   (top {t/10:.2f}, bottom {b/10:.2f}, left {l/10:.2f}, right {r/10:.2f} cm)",
+                lambda n=name: self.set_margins(MARGIN_PRESETS[n])))
+        self.m_margins.addSeparator()
+        self.m_margins.addAction(self._act("Custom margins…", self.custom_margins))
+
+        self.m_orient = self._menu("Orientation")
+        grp = QActionGroup(self)
+        self.orient_acts = {}
+        for key, label in (("portrait", "Portrait"), ("landscape", "Landscape")):
+            a = self._radio(label, lambda k=key: self.set_page(orientation=k), grp)
+            self.m_orient.addAction(a)
+            self.orient_acts[key] = a
+
+        self.m_size = self._menu("Size")
+        grp = QActionGroup(self)
+        self.size_acts = {}
+        for name, (w, h) in PAGE_SIZES.items():
+            a = self._radio(f"{name}   {w:g} × {h:g} mm",
+                            lambda n=name: self.set_page(width_mm=PAGE_SIZES[n][0],
+                                                         height_mm=PAGE_SIZES[n][1]), grp)
+            self.m_size.addAction(a)
+            self.size_acts[name] = a
+
+        self.m_cols = self._menu("Columns")
+        grp = QActionGroup(self)
+        self.col_acts = {}
+        for n, label in ((1, "One"), (2, "Two"), (3, "Three")):
+            a = self._radio(label, lambda n=n: self.set_page(columns=n), grp)
+            self.m_cols.addAction(a)
+            self.col_acts[n] = a
+        self.m_cols.addSeparator()
+        self.m_cols.addAction(self._act("More columns…", self.custom_columns))
+
+        self.m_dir = self._menu("Text direction")
+        self.m_dir.addAction(self._act("Left-to-right", lambda: self.set_direction(False)))
+        self.m_dir.addAction(self._act("Right-to-left", lambda: self.set_direction(True)))
+
+        self.m_break = self._menu("Breaks")
+        self.a_pagebreak = self._act("Page break", self.insert_page_break, "Ctrl+Return",
+                                     tip="Start the next paragraph on a new page")
+        self.m_break.addAction(self.a_pagebreak)
+
+        self.a_linenos = self._act("Line numbers", lambda on: self.set_page(line_numbers=bool(on)), None, True,
+                                   tip="Number every line (saved to .docx, shown in the editor)")
+        self.a_hyphen = self._act("Automatic hyphenation", lambda on: self.set_page(hyphenate=bool(on)), None,
+                                  True, tip="Saved to .docx; Word hyphenates when it opens the file")
+        self.a_hf = self._act("Header && footer…", self.edit_header_footer)
+        self.a_pageno = self._act("Page number", self.add_page_number, tip="Add a page number to the footer")
+        self.a_borders = self._act("Page borders…", self.edit_borders)
+        self.m_watermark = self._menu("Watermark")
+        for label in ("DRAFT", "CONFIDENTIAL", "SAMPLE"):
+            self.m_watermark.addAction(self._act(label.title(), lambda t=label: self.set_page(watermark=t)))
+        self.m_watermark.addAction(self._act("Custom text…", self.custom_watermark))
+        self.m_watermark.addSeparator()
+        self.m_watermark.addAction(self._act("Remove watermark", lambda: self.set_page(watermark="")))
+
+        for text, menu, tip in (("Text direction", self.m_dir, "Direction of the current paragraph"),
+                                ("Margins", self.m_margins, "Page margins"),
+                                ("Orientation", self.m_orient, "Portrait or landscape"),
+                                ("Size", self.m_size, "Paper size"),
+                                ("Columns", self.m_cols, "Text columns (saved to .docx / PDF)"),
+                                ("Breaks", self.m_break, "Page break")):
+            self._tool_menu(tb, text, menu, tip)
+        for a in (self.a_linenos, self.a_hyphen):
+            b = QToolButton()
+            b.setDefaultAction(a)
+            b.setText(a.text())
+            tb.addWidget(b)
+        tb.addSeparator()
+        for a in (self.a_hf, self.a_pageno, self.a_borders):
+            b = QToolButton()
+            b.setDefaultAction(a)
+            tb.addWidget(b)
+        self._tool_menu(tb, "Watermark", self.m_watermark, "Text watermark behind the page")
+        tb.addSeparator()
+
+        def dspin(label, suffix, maxv, step, decimals, slot):
+            tb.addWidget(QLabel(f" {label} "))
+            sp = QDoubleSpinBox()
+            sp.setRange(0, maxv)
+            sp.setSingleStep(step)
+            sp.setDecimals(decimals)
+            sp.setSuffix(suffix)
+            sp.setMaximumWidth(92)
+            sp.valueChanged.connect(slot)
+            tb.addWidget(sp)
+            return sp
+
+        self.sp_left = dspin("Indent left", " cm", 20, 0.25, 2, lambda v: self.set_indent("left", v))
+        self.sp_right = dspin("right", " cm", 20, 0.25, 2, lambda v: self.set_indent("right", v))
+        self.sp_before = dspin("Spacing before", " pt", 200, 1, 0, lambda v: self.set_spacing("top", v))
+        self.sp_after = dspin("after", " pt", 200, 1, 0, lambda v: self.set_spacing("bottom", v))
+        tb.setVisible(str(self.settings.value("show_layout", "true")).lower() == "true")
+
+    def _sync_layout_ui(self):
+        if not hasattr(self, "orient_acts"):
+            return
+        ps = self.page
+        self.orient_acts[ps.orientation].setChecked(True)
+        a = self.size_acts.get(ps.size_name)
+        if a:
+            a.setChecked(True)
+        else:
+            for x in self.size_acts.values():
+                x.setChecked(False)
+        for n, act in self.col_acts.items():
+            act.setChecked(n == ps.columns)
+        for act, val in ((self.a_linenos, ps.line_numbers), (self.a_hyphen, ps.hyphenate)):
+            act.blockSignals(True)
+            act.setChecked(val)
+            act.blockSignals(False)
+
+    def _commit_page(self):
+        self.editor.apply_page(self.page)
+        self.editor.document().setModified(True)
+        self._sync_layout_ui()
+
+    def set_page(self, **kw):
+        self.page = self.page.with_(**kw)
+        self._commit_page()
+
+    def set_margins(self, m):
+        self.set_page(top=m[0], bottom=m[1], left=m[2], right=m[3])
+
+    def custom_margins(self):
+        ps = margins_dialog(self, self.page)
+        if ps:
+            self.page = ps
+            self._commit_page()
+
+    def custom_columns(self):
+        ps = columns_dialog(self, self.page)
+        if ps:
+            self.page = ps
+            self._commit_page()
+
+    def edit_header_footer(self):
+        ps = header_footer_dialog(self, self.page)
+        if ps:
+            self.page = ps
+            self._commit_page()
+
+    def edit_borders(self):
+        ps = borders_dialog(self, self.page)
+        if ps:
+            self.page = ps
+            self._commit_page()
+
+    def add_page_number(self):
+        if "{page}" not in self.page.footer:
+            self.set_page(footer=(self.page.footer + "  " if self.page.footer else "") + "Page {page}")
+
+    def custom_watermark(self):
+        t, ok = QInputDialog.getText(self, "Watermark", "Watermark text:", text=self.page.watermark)
+        if ok:
+            self.set_page(watermark=t.strip())
+
+    def insert_page_break(self):
+        cur = self.editor.textCursor()
+        cur.beginEditBlock()
+        if cur.block().text() or cur.currentList() is not None:
+            cur.insertBlock(default_bf(), QTextCharFormat())
+        bf = default_bf()
+        bf.setPageBreakPolicy(QTextFormat.PageBreakFlag.PageBreak_AlwaysBefore)
+        cur.setBlockFormat(bf)
+        cur.endEditBlock()
+        self.editor.setTextCursor(cur)
+
+    def _selected_blocks(self):
+        cur = self.editor.textCursor()
+        a, b = sorted((cur.anchor(), cur.position()))
+        blk, out = self.editor.document().findBlock(a), []
+        while blk.isValid() and blk.position() <= b:
+            out.append(blk)
+            blk = blk.next()
+        return out
+
+    def _edit_blocks(self, fn):
+        cur = self.editor.textCursor()
+        cur.beginEditBlock()
+        for blk in self._selected_blocks():
+            c = QTextCursor(blk)
+            bf = c.blockFormat()
+            fn(bf)
+            c.setBlockFormat(bf)
+        cur.endEditBlock()
+
+    def set_indent(self, side, cm):
+        px = cm * 96 / 2.54
+        self._edit_blocks(lambda bf: bf.setLeftMargin(px) if side == "left" else bf.setRightMargin(px))
+
+    def set_spacing(self, which, pt):
+        px = pt / 0.75
+        self._edit_blocks(lambda bf: bf.setTopMargin(px) if which == "top" else bf.setBottomMargin(px))
+
+    def set_direction(self, rtl):
+        d = Qt.LayoutDirection.RightToLeft if rtl else Qt.LayoutDirection.LeftToRight
+        self._edit_blocks(lambda bf: bf.setLayoutDirection(d))
+
+    def _sync_para_spins(self):
+        if not hasattr(self, "sp_left"):
+            return
+        bf = self.editor.textCursor().blockFormat()
+        for sp, v in ((self.sp_left, bf.leftMargin() * 2.54 / 96), (self.sp_right, bf.rightMargin() * 2.54 / 96),
+                      (self.sp_before, bf.topMargin() * 0.75), (self.sp_after, bf.bottomMargin() * 0.75)):
+            sp.blockSignals(True)
+            sp.setValue(v)
+            sp.blockSignals(False)
+
+    # ---- smart paste
+    def set_smart_paste(self, on):
+        self.editor.smart_paste = bool(on)
+        self.settings.setValue("smart_paste", "true" if on else "false")
+
+    def format_selection(self):
+        """Turn selected raw text (markdown / LaTeX / tab tables) into formatted blocks."""
+        cur = self.editor.textCursor()
+        if not cur.hasSelection():
+            self.statusBar().showMessage("Select the raw text you want formatted first (Ctrl+A for all).", 4000)
+            return
+        text = cur.selection().toPlainText()
+        if self.editor.smart_insert(text, cur):
+            self.statusBar().showMessage("Formatted. Ctrl+Z undoes it.", 3000)
+        else:
+            self.statusBar().showMessage("Nothing to format in that selection.", 3000)
+
     # ---- aesthetic (syntax-style colours, display only)
     def set_aesthetic(self, on):
         self.aesthetic = bool(on)
@@ -1821,7 +2372,8 @@ class MainWindow(QMainWindow):
                 while not it.atEnd():
                     fr = it.fragment()
                     fm = fr.charFormat()
-                    if not fm.hasProperty(CITE_PROP) and fm.foreground().style() == Qt.BrushStyle.NoBrush:
+                    if (not fm.hasProperty(CITE_PROP) and not fm.hasProperty(MATH_PROP)
+                            and fm.foreground().style() == Qt.BrushStyle.NoBrush):
                         if fm.fontWeight() >= 600:
                             add(fr.position(), fr.length(), t["maroon"])
                         elif fm.fontItalic():
@@ -1850,7 +2402,31 @@ class MainWindow(QMainWindow):
             s.cursor = c
             s.format = f
             sels.append(s)
+        sels += self._box_selections()
         self.editor.setExtraSelections(sels)
+
+    def _box_selections(self):
+        """Tint \\boxed math (a Word run border in the saved .docx)."""
+        out, doc = [], self.editor.document()
+        tint = QColor(self.theme["mauve"])
+        tint.setAlpha(40)
+        block = doc.begin()
+        while block.isValid() and len(out) < 5000:
+            it = block.begin()
+            while not it.atEnd():
+                fr = it.fragment()
+                if fr.charFormat().boolProperty(BOX_PROP):
+                    c = QTextCursor(doc)
+                    c.setPosition(fr.position())
+                    c.setPosition(fr.position() + fr.length(), QTextCursor.MoveMode.KeepAnchor)
+                    f = QTextCharFormat()
+                    f.setBackground(tint)
+                    sel = QTextEdit.ExtraSelection()
+                    sel.cursor, sel.format = c, f
+                    out.append(sel)
+                it += 1
+            block = block.next()
+        return out
 
 
 def main():
@@ -1858,6 +2434,19 @@ def main():
     app.setOrganizationName("Quill")
     app.setApplicationName("Quill")
     app.setStyle("Fusion")
+    if sys.platform == "win32":  # lets the taskbar show Quill's icon instead of python.exe's
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("quill.editor")
+        except Exception:
+            pass
+    icon_dir = BASE_DIR / "assets"
+    icon = QIcon()
+    for name in ("quill.ico", "quill.png"):
+        if (icon_dir / name).exists():
+            icon = QIcon(str(icon_dir / name))
+            break
+    app.setWindowIcon(icon)
     win = MainWindow()
     win.show()
     if len(sys.argv) > 1 and sys.argv[1].lower().endswith(".docx"):

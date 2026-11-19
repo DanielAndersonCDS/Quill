@@ -1,0 +1,43 @@
+# **Properties of Relations — Complete 49-Slide Lesson**
+
+| Slides | Topic                      | What you need to understand                                         |
+| ------ | -------------------------- | ------------------------------------------------------------------- |
+| 1–4    | Introduction               | Learning objectives and structure                                   |
+| 5–12   | Relations on sets          | Binary relations, ordered pairs, inverse relations, directed graphs |
+
+There is a progression here:
+
+1. First, we learn what a relation actually is.
+2. Then we learn how to identify its properties.
+
+## **Slide 6 — What exactly is a relation?**
+
+### **1.1 Start with sets**
+
+Suppose we have two sets:
+
+\\[ A=\\{1,2,3\\} \\]
+
+For example:
+
+\\[ (1,a)\neq(a,1) \\]
+
+> A binary relation from A to B is a subset of A × B.
+
+\\[ \boxed{mEn\iff m-n\text{ is even}} \\]
+
+**Example 1: Is&#x20;**\\(4E0\\)**?**
+
+\\[ \boxed{5\not E2} \\]
+
+- If \\(k=0\\), then \\(n=1\\).
+- If \\(k=-1\\), then \\(n=-1\\).
+
+\\[ \boxed{ R^{-1}=\\{(y,x)\in B\times A\mid(x,y)\in R\\} } \\]
+
+| x | y | Does x divide y?    | Result |
+| - | - | ------------------- | ------ |
+| 2 | 2 | \\(2=1(2)\\)        | Yes    |
+| 3 | 2 | No integer multiple | No     |
+
+\\[ \boxed{xRy\iff x\<y} \\]

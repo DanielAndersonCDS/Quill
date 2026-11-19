@@ -1,0 +1,29 @@
+Properties of Relations — Part 2: Problem-Solving Workshop
+We have covered the definitions.
+1. Understanding how to approach mathematical definitions
+Before solving anything, I want to explain.
+There are five skills:
+1. Convert mathematical definitions into practical procedures.
+2. Prove properties rather than just recognize them.
+1.1 Proving something is true versus proving something is false
+Suppose a question asks whether R is reflexive.
+\[
+\forall x\in A,\quad xRx
+\]
+Property	To prove true	To prove false
+Reflexive	Every self-pair exists	Find one missing self-pair
+Symmetric	Every pair has its reverse	Find one pair without its reverse
+\[
+\begin{aligned}
+R=\{&
+(a,a),(b,b),\\
+&(a,b),(b,a)
+\}
+\end{aligned}
+\]
+Hasse diagram of divisibility
+A line means the lower element divides the higher element.
+Therefore:
+\[
+\boxed{\text{Maximal}=\{6\}}
+\]
